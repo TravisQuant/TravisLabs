@@ -1,8 +1,18 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 app = FastAPI(
     title="TravisLabs Quant API"
+)
+
+# Allow the public website to call this API.
+# Fine for our public demo endpoints; we are not using logins/cookies.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -30,17 +40,14 @@ class RateShockRequest(BaseModel):
 @app.post("/rates/shock")
 def rate_shock(request: RateShockRequest):
 
-    # Convert basis points to decimal yield change
     delta_y = request.rate_shock_bp / 10000
 
-    # Duration + convexity approximation
     percentage_change = (
         -request.duration * delta_y
         + 0.5 * request.convexity * delta_y**2
     )
 
     pnl = request.portfolio_value * percentage_change
-
     stressed_value = request.portfolio_value + pnl
 
     return {
