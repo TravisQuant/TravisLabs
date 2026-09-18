@@ -7,14 +7,15 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from stochastic_engine import router as stochastic_router
+
 
 # ============================================================
-# FASTAPI APPLICATION
+# FASTAPI APP
 # ============================================================
 
 app = FastAPI(
     title="TravisLabs API",
-    description="Quantitative finance API for TravisLabs.",
     version="1.0.0",
 )
 
@@ -26,34 +27,25 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
 # ============================================================
-# C++ DERIVATIVES ENGINE
+# STOCHASTIC PROCESS ROUTER
 # ============================================================
-#
-# Project structure:
-#
-# TravisLabs/
-# ├── api/
-# │   └── main.py
-# └── cpp/
-#     ├── option_pricer.cpp
-#     ├── bindings.cpp
-#     └── travislabs_pricer....pyd
-#
-# Locally on Windows, pybind11 builds a .pyd module.
-# Later Railway will build the corresponding Linux extension.
+
+app.include_router(stochastic_router)
+
+
+# ============================================================
+# C++ DERIVATIVES ENGINE
 # ============================================================
 
 CPP_DIR = (
-    Path(__file__)
-    .resolve()
-    .parent
+    Path(__file__).resolve().parent
     / "cpp"
 )
 
@@ -64,20 +56,20 @@ if str(CPP_DIR) not in sys.path:
     )
 
 
+CPP_PRICER_AVAILABLE = False
+CPP_PRICER_ERROR = None
+
 try:
     import travislabs_pricer
 
     CPP_PRICER_AVAILABLE = True
-    CPP_PRICER_ERROR = None
 
 except Exception as exc:
-    travislabs_pricer = None
-    CPP_PRICER_AVAILABLE = False
     CPP_PRICER_ERROR = str(exc)
 
 
 # ============================================================
-# BANK OF CANADA CURVE CONFIGURATION
+# BANK OF CANADA CURVE SERIES
 # ============================================================
 
 BOC_CURVE_SERIES = [
@@ -134,6 +126,7 @@ class DerivativesPriceRequest(BaseModel):
 
     binomial_steps: int = 500
     mc_paths: int = 100000
+
     pde_space_steps: int = 400
     pde_time_steps: int = 400
 
@@ -145,8 +138,19 @@ class DerivativesPriceRequest(BaseModel):
 @app.get("/")
 def root():
     return {
-        "message": "TravisLabs API is running",
-        "cpp_derivatives_engine": CPP_PRICER_AVAILABLE,
+        "message": "TravisLabs Quantitative Finance API",
+        "services": {
+            "rates": True,
+            "stochastic_processes": True,
+            "cpp_derivatives_engine": {
+                "available": (
+                    CPP_PRICER_AVAILABLE
+                ),
+                "error": (
+                    CPP_PRICER_ERROR
+                ),
+            },
+        },
     }
 
 
@@ -159,26 +163,43 @@ def health():
     return {
         "status": "ok",
         "cpp_derivatives_engine": {
-            "available": CPP_PRICER_AVAILABLE,
-            "error": CPP_PRICER_ERROR,
+            "available": (
+                CPP_PRICER_AVAILABLE
+            ),
+            "error": (
+                CPP_PRICER_ERROR
+            ),
+        },
+        "stochastic_engine": {
+            "available": True,
+            "engine": "Python/NumPy",
         },
     }
 
 
 # ============================================================
-# RATES — DURATION / CONVEXITY SHOCK
+# RATE SHOCK ENGINE
 # ============================================================
 
 @app.post("/rates/shock")
-def rate_shock(
+def calculate_rate_shock(
     request: RateShockRequest,
 ):
+    """
+    Duration / convexity approximation:
+
+        ΔP/P ≈ -D * Δy
+                + 0.5 * C * (Δy)^2
+
+    where Δy is expressed in decimal yield units.
+    """
+
     delta_y = (
         request.rate_shock_bp
         / 10000.0
     )
 
-    percentage_change = (
+    estimated_return = (
         -request.duration
         * delta_y
         +
@@ -187,47 +208,58 @@ def rate_shock(
         * delta_y**2
     )
 
-    pnl = (
+    estimated_pnl = (
         request.portfolio_value
-        * percentage_change
+        * estimated_return
     )
 
     stressed_value = (
         request.portfolio_value
-        + pnl
+        + estimated_pnl
     )
 
     return {
-        "original_value": request.portfolio_value,
-        "rate_shock_bp": request.rate_shock_bp,
+        "original_value": (
+            request.portfolio_value
+        ),
+        "rate_shock_bp": (
+            request.rate_shock_bp
+        ),
         "estimated_return_pct": (
-            percentage_change
+            estimated_return
             * 100.0
         ),
-        "estimated_pnl": pnl,
-        "stressed_value": stressed_value,
+        "estimated_pnl": (
+            estimated_pnl
+        ),
+        "stressed_value": (
+            stressed_value
+        ),
     }
 
 
 # ============================================================
-# RATES — BANK OF CANADA YIELD CURVE
+# BANK OF CANADA CURVE
 # ============================================================
 
 @app.get("/rates/curve")
 def get_rates_curve():
     curve = []
-    warnings = []
 
-    for config in BOC_CURVE_SERIES:
-        series = config["series"]
+    observation_dates = []
 
-        url = (
-            "https://www.bankofcanada.ca/"
-            f"valet/observations/{series}/json"
-            "?recent=10&order_dir=desc"
-        )
+    try:
+        for instrument in BOC_CURVE_SERIES:
+            series = instrument["series"]
 
-        try:
+            url = (
+                "https://www.bankofcanada.ca/"
+                "valet/observations/"
+                f"{series}/json"
+                "?recent=10"
+                "&order_dir=desc"
+            )
+
             response = requests.get(
                 url,
                 timeout=10,
@@ -235,147 +267,137 @@ def get_rates_curve():
 
             response.raise_for_status()
 
-            data = response.json()
+            payload = response.json()
 
-            observations = data.get(
+            observations = payload.get(
                 "observations",
                 [],
             )
 
-            selected = None
+            latest_value = None
+            latest_date = None
 
             for observation in observations:
                 series_data = observation.get(
-                    series
+                    series,
+                    {},
                 )
 
-                if not series_data:
-                    continue
+                raw_value = (
+                    series_data.get("v")
+                )
 
-                value = series_data.get("v")
-
-                if value in (
-                    None,
-                    "",
-                    "NA",
-                    "null",
-                ):
+                if raw_value is None:
                     continue
 
                 try:
-                    numeric_value = float(value)
+                    latest_value = float(
+                        raw_value
+                    )
+
+                    latest_date = (
+                        observation.get("d")
+                    )
+
+                    break
+
                 except (
                     TypeError,
                     ValueError,
                 ):
                     continue
 
-                selected = {
-                    "series": series,
-                    "maturity": config[
-                        "maturity"
-                    ],
-                    "label": config[
-                        "label"
-                    ],
-                    "yield": numeric_value,
-                    "date": observation.get(
-                        "d"
-                    ),
-                }
-
-                break
-
-            if selected is None:
-                warnings.append(
-                    f"No valid observation found for {series}"
-                )
+            if latest_value is None:
                 continue
 
-            curve.append(selected)
-
-        except Exception as exc:
-            warnings.append(
-                f"{series}: {str(exc)}"
+            curve.append(
+                {
+                    "series": series,
+                    "label": (
+                        instrument["label"]
+                    ),
+                    "maturity": (
+                        instrument[
+                            "maturity"
+                        ]
+                    ),
+                    "yield": latest_value,
+                    "date": latest_date,
+                }
             )
 
-    curve.sort(
-        key=lambda point: point[
-            "maturity"
-        ]
-    )
+            if latest_date:
+                observation_dates.append(
+                    latest_date
+                )
+
+    except requests.RequestException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Unable to retrieve "
+                "Bank of Canada data: "
+                f"{exc}"
+            ),
+        )
 
     if not curve:
         raise HTTPException(
             status_code=502,
-            detail={
-                "message": (
-                    "Unable to retrieve Bank of "
-                    "Canada yield curve data."
-                ),
-                "warnings": warnings,
-            },
+            detail=(
+                "No Bank of Canada "
+                "yield observations "
+                "were available."
+            ),
         )
 
-    dates = [
-        point["date"]
-        for point in curve
-        if point.get("date")
-    ]
-
     as_of = (
-        max(dates)
-        if dates
+        max(observation_dates)
+        if observation_dates
         else None
     )
 
     return {
-        "source": "Bank of Canada Valet API",
-        "curve_type": (
-            "Government of Canada "
-            "benchmark bond yields"
+        "source": (
+            "Bank of Canada Valet API"
         ),
         "as_of": as_of,
         "curve": curve,
-        "warnings": warnings,
     }
 
 
 # ============================================================
-# DERIVATIVES — C++ PRICING ENGINE
+# C++ DERIVATIVES PRICING
 # ============================================================
 
 @app.post("/derivatives/price")
-def derivatives_price(
+def price_derivative(
     request: DerivativesPriceRequest,
 ):
-    # --------------------------------------------------------
-    # Make sure compiled C++ module is available
-    # --------------------------------------------------------
-
     if not CPP_PRICER_AVAILABLE:
         raise HTTPException(
             status_code=503,
             detail={
                 "message": (
-                    "C++ derivatives engine "
-                    "is not available."
+                    "C++ derivatives "
+                    "engine unavailable"
                 ),
-                "error": CPP_PRICER_ERROR,
+                "error": (
+                    CPP_PRICER_ERROR
+                ),
             },
         )
 
-
     # --------------------------------------------------------
-    # Validate financial inputs
+    # INPUT VALIDATION
     # --------------------------------------------------------
 
     if request.spot <= 0:
         raise HTTPException(
             status_code=400,
             detail=(
-                "spot must be greater "
-                "than zero"
+                "spot must be "
+                "greater than zero"
             ),
         )
 
@@ -383,8 +405,8 @@ def derivatives_price(
         raise HTTPException(
             status_code=400,
             detail=(
-                "strike must be greater "
-                "than zero"
+                "strike must be "
+                "greater than zero"
             ),
         )
 
@@ -392,8 +414,8 @@ def derivatives_price(
         raise HTTPException(
             status_code=400,
             detail=(
-                "volatility must be greater "
-                "than zero"
+                "volatility must be "
+                "greater than zero"
             ),
         )
 
@@ -401,22 +423,17 @@ def derivatives_price(
         raise HTTPException(
             status_code=400,
             detail=(
-                "maturity must be greater "
-                "than zero"
+                "maturity must be "
+                "greater than zero"
             ),
         )
-
-
-    # --------------------------------------------------------
-    # Validate numerical settings
-    # --------------------------------------------------------
 
     if request.binomial_steps < 1:
         raise HTTPException(
             status_code=400,
             detail=(
-                "binomial_steps must "
-                "be at least 1"
+                "binomial_steps "
+                "must be >= 1"
             ),
         )
 
@@ -424,8 +441,7 @@ def derivatives_price(
         raise HTTPException(
             status_code=400,
             detail=(
-                "mc_paths must "
-                "be at least 2"
+                "mc_paths must be >= 2"
             ),
         )
 
@@ -433,8 +449,8 @@ def derivatives_price(
         raise HTTPException(
             status_code=400,
             detail=(
-                "pde_space_steps must "
-                "be at least 3"
+                "pde_space_steps "
+                "must be >= 3"
             ),
         )
 
@@ -442,26 +458,32 @@ def derivatives_price(
         raise HTTPException(
             status_code=400,
             detail=(
-                "pde_time_steps must "
-                "be at least 1"
+                "pde_time_steps "
+                "must be >= 1"
             ),
         )
 
+    S = request.spot
+    K = request.strike
+    r = request.rate
+    sigma = request.volatility
+    T = request.maturity
 
-    # ========================================================
+
+    # --------------------------------------------------------
     # BLACK-SCHOLES
-    # ========================================================
+    # --------------------------------------------------------
 
     start = time.perf_counter()
 
     black_scholes = (
         travislabs_pricer
         .black_scholes_call(
-            request.spot,
-            request.strike,
-            request.rate,
-            request.volatility,
-            request.maturity,
+            S,
+            K,
+            r,
+            sigma,
+            T,
         )
     )
 
@@ -470,30 +492,25 @@ def derivatives_price(
         - start
     ) * 1000.0
 
-    black_scholes[
-        "runtime_ms"
-    ] = black_scholes_runtime_ms
-
-
-    benchmark_price = (
+    bs_price = float(
         black_scholes["price"]
     )
 
 
-    # ========================================================
-    # CRR BINOMIAL
-    # ========================================================
+    # --------------------------------------------------------
+    # BINOMIAL
+    # --------------------------------------------------------
 
     start = time.perf_counter()
 
     binomial = (
         travislabs_pricer
         .binomial_call(
-            request.spot,
-            request.strike,
-            request.rate,
-            request.volatility,
-            request.maturity,
+            S,
+            K,
+            r,
+            sigma,
+            T,
             request.binomial_steps,
         )
     )
@@ -503,33 +520,25 @@ def derivatives_price(
         - start
     ) * 1000.0
 
-
-    binomial[
-        "absolute_error"
-    ] = abs(
+    binomial_price = float(
         binomial["price"]
-        - benchmark_price
     )
 
-    binomial[
-        "runtime_ms"
-    ] = binomial_runtime_ms
 
-
-    # ========================================================
+    # --------------------------------------------------------
     # MONTE CARLO
-    # ========================================================
+    # --------------------------------------------------------
 
     start = time.perf_counter()
 
     monte_carlo = (
         travislabs_pricer
         .monte_carlo_call(
-            request.spot,
-            request.strike,
-            request.rate,
-            request.volatility,
-            request.maturity,
+            S,
+            K,
+            r,
+            sigma,
+            T,
             request.mc_paths,
         )
     )
@@ -539,33 +548,25 @@ def derivatives_price(
         - start
     ) * 1000.0
 
-
-    monte_carlo[
-        "absolute_error"
-    ] = abs(
+    monte_carlo_price = float(
         monte_carlo["price"]
-        - benchmark_price
     )
 
-    monte_carlo[
-        "runtime_ms"
-    ] = monte_carlo_runtime_ms
 
-
-    # ========================================================
-    # CRANK-NICOLSON PDE
-    # ========================================================
+    # --------------------------------------------------------
+    # CRANK-NICOLSON
+    # --------------------------------------------------------
 
     start = time.perf_counter()
 
     crank_nicolson = (
         travislabs_pricer
         .crank_nicolson_call(
-            request.spot,
-            request.strike,
-            request.rate,
-            request.volatility,
-            request.maturity,
+            S,
+            K,
+            r,
+            sigma,
+            T,
             request.pde_space_steps,
             request.pde_time_steps,
         )
@@ -576,40 +577,66 @@ def derivatives_price(
         - start
     ) * 1000.0
 
-
-    crank_nicolson[
-        "absolute_error"
-    ] = abs(
+    crank_nicolson_price = float(
         crank_nicolson["price"]
-        - benchmark_price
     )
 
-    crank_nicolson[
-        "runtime_ms"
-    ] = crank_nicolson_runtime_ms
 
-
-    # ========================================================
+    # --------------------------------------------------------
     # RESPONSE
-    # ========================================================
+    # --------------------------------------------------------
 
     return {
         "engine": (
-            "TravisLabs C++17 via pybind11"
+            "TravisLabs C++17 "
+            "via pybind11"
         ),
+
         "inputs": {
-            "spot": request.spot,
-            "strike": request.strike,
-            "rate": request.rate,
-            "volatility": (
-                request.volatility
-            ),
-            "maturity": request.maturity,
+            "spot": S,
+            "strike": K,
+            "rate": r,
+            "volatility": sigma,
+            "maturity": T,
         },
-        "black_scholes": black_scholes,
-        "binomial": binomial,
-        "monte_carlo": monte_carlo,
-        "crank_nicolson": (
-            crank_nicolson
-        ),
+
+        "black_scholes": {
+            **black_scholes,
+            "runtime_ms": (
+                black_scholes_runtime_ms
+            ),
+        },
+
+        "binomial": {
+            **binomial,
+            "absolute_error": abs(
+                binomial_price
+                - bs_price
+            ),
+            "runtime_ms": (
+                binomial_runtime_ms
+            ),
+        },
+
+        "monte_carlo": {
+            **monte_carlo,
+            "absolute_error": abs(
+                monte_carlo_price
+                - bs_price
+            ),
+            "runtime_ms": (
+                monte_carlo_runtime_ms
+            ),
+        },
+
+        "crank_nicolson": {
+            **crank_nicolson,
+            "absolute_error": abs(
+                crank_nicolson_price
+                - bs_price
+            ),
+            "runtime_ms": (
+                crank_nicolson_runtime_ms
+            ),
+        },
     }
