@@ -18,3 +18,4 @@ typing_extensions==4.16.0
 urllib3==2.8.0
 uvicorn==0.53.0
 numpy==2.5.3
+scipy==1.18.1
